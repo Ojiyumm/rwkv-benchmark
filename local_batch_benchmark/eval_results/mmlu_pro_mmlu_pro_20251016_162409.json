@@ -1,0 +1,23 @@
+{
+  "timestamp": "20251016_162409",
+  "dataset": {
+    "name": "mmlu_pro",
+    "path": "/home/rwkv/Peter/rwkveval/benchmarkdata/mmlupro",
+    "size": 128,
+    "limit": 128
+  },
+  "evaluator": "mmlu_pro",
+  "config": {
+    "batch_size": 64,
+    "max_length": 10
+  },
+  "metrics": {
+    "accuracy": 0.109375,
+    "correct": 14,
+    "total": 128,
+    "subject_accuracies": {
+      "business": 0.109375
+    },
+    "num_subjects": 1
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "timestamp": "20251016_163513",
+  "dataset": {
+    "name": "mmlu_pro",
+    "path": "/home/rwkv/Peter/rwkveval/benchmarkdata/mmlupro",
+    "size": 12032,
+    "limit": null
+  },
+  "evaluator": "mmlu_pro",
+  "config": {
+    "batch_size": 512,
+    "max_length": 10,
+    "inferoutput": "/home/rwkv/Peter/rwkveval/results/mmlupro.jsonl"
+  },
+  "metrics": {
+    "accuracy": 0.10729720744680851,
+    "correct": 1291,
+    "total": 12032,
+    "subject_accuracies": {
+      "business": 0.09759188846641319,
+      "law": 0.09355131698455948,
+      "psychology": 0.08897243107769423,
+      "biology": 0.09902370990237098,
+      "chemistry": 0.11484098939929328,
+      "history": 0.09973753280839895,
+      "other": 0.11580086580086581,
+      "health": 0.1198044009779951,
+      "economics": 0.13151658767772512,
+      "math": 0.0999259807549963,
+      "physics": 0.10623556581986143,
+      "computer science": 0.11951219512195121,
+      "philosophy": 0.11422845691382766,
+      "engineering": 0.10939112487100103
+    },
+    "num_subjects": 14
+  }
+}
