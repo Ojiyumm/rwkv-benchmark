@@ -157,3 +157,104 @@ class TRIE_TOKENIZER():
                 pass
             print(f'{repr(s)}{i}', end=' ')
         print()
+
+
+@MyStatic
+def sample_logits_batch(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    alpha_presence: float = 0.0,
+    alpha_frequency: float = 0.0,
+    token_counts: torch.Tensor = None
+) -> torch.Tensor:
+    """
+    Advanced batch sampling with top_k, top_p, and repetition penalties
+
+    Args:
+        logits: [batch_size, vocab_size] logits tensor
+        temperature: sampling temperature
+        top_p: nucleus sampling probability
+        top_k: top-k sampling limit
+        alpha_presence: presence penalty (0.0 = disabled)
+        alpha_frequency: frequency penalty (0.0 = disabled)
+        token_counts: [batch_size, vocab_size] token frequency counts for penalties
+
+    Returns:
+        sampled_tokens: [batch_size, 1] tensor of sampled token indices
+    """
+    batch_size, vocab_size = logits.shape
+    device = logits.device
+
+    # Clone logits to avoid modifying input
+    logits = logits.clone().float()
+
+    # Apply repetition penalties if enabled
+    if alpha_presence > 0.0 or alpha_frequency > 0.0:
+        if token_counts is not None:
+            # Presence penalty: -alpha_presence for any token that appeared
+            if alpha_presence > 0.0:
+                presence_mask = (token_counts > 0).float()
+                logits -= alpha_presence * presence_mask
+
+            # Frequency penalty: -alpha_frequency * count for each token
+            if alpha_frequency > 0.0:
+                logits -= alpha_frequency * token_counts.float()
+
+    # Greedy path when temperature is effectively zero
+    if temperature is not None and temperature <= 0.0:
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    # Apply temperature
+    if temperature != 1.0:
+        logits = logits / temperature
+
+    # Convert to probabilities
+    probs = F.softmax(logits, dim=-1)
+
+    # Apply top_k filtering
+    if top_k > 0 and top_k < vocab_size:
+        # Get top_k indices for each sample in batch
+        top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
+
+        # Create mask for top_k tokens
+        top_k_mask = torch.zeros_like(probs, dtype=torch.bool, device=device)
+        top_k_mask.scatter_(1, top_k_indices, True)
+
+        # Zero out probabilities not in top_k
+        probs = probs * top_k_mask.float()
+
+    # Apply top_p (nucleus) filtering
+    if top_p < 1.0:
+        # Sort probabilities in descending order
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+
+        # Calculate cumulative probabilities
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+        # Find cutoff for each sample
+        cutoff_mask = cumulative_probs <= top_p
+
+        # Include at least one token (the highest probability one)
+        cutoff_mask[:, 0] = True
+
+        # Zero out probabilities beyond cutoff
+        sorted_probs = sorted_probs * cutoff_mask.float()
+
+        # Scatter back to original positions
+        probs.zero_()
+        probs.scatter_(1, sorted_indices, sorted_probs)
+
+    # Renormalize probabilities
+    probs = probs / torch.sum(probs, dim=-1, keepdim=True)
+
+    # Handle edge case of all-zero probabilities
+    probs = torch.where(torch.sum(probs, dim=-1, keepdim=True) == 0,
+                       torch.ones_like(probs) / vocab_size,
+                       probs)
+
+    # Sample from the distribution
+    sampled_tokens = torch.multinomial(probs, num_samples=1)
+
+    return sampled_tokens

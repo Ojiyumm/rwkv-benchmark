@@ -58,6 +58,8 @@ class EvaluationPipeline:
         max_length: Optional[int] = None,
         limit: Optional[int] = None,
         save_results: bool = True,
+        save_incorrect: bool = True,
+        incorrect_only_file: Optional[str] = None,
         **eval_kwargs
     ) -> Dict[str, Any]:
         """
@@ -71,6 +73,8 @@ class EvaluationPipeline:
             max_length: 最大生成长度（None则使用数据集默认值）
             limit: 限制样本数量（用于快速测试）
             save_results: 是否保存结果
+            save_incorrect: 是否尝试保存所有错误案例的输入输出
+            incorrect_only_file: 指定错误案例保存路径（jsonl格式），默认为输出目录下自动生成
             **eval_kwargs: 传递给评估器的额外参数
             
         Returns:
@@ -100,6 +104,30 @@ class EvaluationPipeline:
         print(f"      Batch size: {batch_size}")
         print(f"      Max length: {max_length}")
         
+        # 预先生成时间戳，供输出文件统一使用
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 拷贝评估器参数，避免外部字典被修改
+        eval_kwargs = dict(eval_kwargs)
+        
+        # 如果需要收集错误样本，确保评估器可以输出逐样本结果
+        inferoutput_path = eval_kwargs.get('inferoutput')
+        inference_enabled = False
+        if save_incorrect:
+            if not inferoutput_path:
+                inference_dir = os.path.join(self.output_dir, "inference_logs")
+                os.makedirs(inference_dir, exist_ok=True)
+                inferoutput_path = os.path.join(
+                    inference_dir,
+                    f"{dataset_name}_{evaluator_name}_{timestamp}.jsonl"
+                )
+                eval_kwargs['inferoutput'] = inferoutput_path
+            # 确保目录存在
+            infer_dirname = os.path.dirname(inferoutput_path)
+            if infer_dirname:
+                os.makedirs(infer_dirname, exist_ok=True)
+            inference_enabled = True
+        
         # 2. 运行评估
         print(f"\n[2/3] Running evaluator: {evaluator_name}")
         
@@ -115,8 +143,47 @@ class EvaluationPipeline:
         # 3. 保存结果
         print(f"\n[3/3] Finalizing results")
         
+        incorrect_samples = []
+        incorrect_file_path = None
+        inference_file_exists = inferoutput_path and os.path.exists(inferoutput_path)
+        
+        if save_incorrect and inference_enabled:
+            if inference_file_exists:
+                with open(inferoutput_path, 'r', encoding='utf-8') as f:
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            print(f"⚠ Skipping malformed JSON at line {line_num} in {inferoutput_path}")
+                            continue
+                        
+                        # 仅当评估记录中提供 is_correct 字段时才判断
+                        if record.get('is_correct') is False:
+                            incorrect_samples.append(record)
+                
+                if incorrect_samples:
+                    incorrect_file_path = incorrect_only_file or os.path.join(
+                        self.output_dir,
+                        f"{dataset_name}_{evaluator_name}_{timestamp}_incorrect.jsonl"
+                    )
+                    incorrect_dir = os.path.dirname(incorrect_file_path)
+                    if incorrect_dir:
+                        os.makedirs(incorrect_dir, exist_ok=True)
+                    
+                    with open(incorrect_file_path, 'w', encoding='utf-8') as f:
+                        for item in incorrect_samples:
+                            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                    
+                    print(f"✓ Incorrect samples saved to: {incorrect_file_path} (count: {len(incorrect_samples)})")
+                else:
+                    print("✓ No incorrect samples found; nothing saved.")
+            else:
+                print(f"⚠ Expected inference output at {inferoutput_path}, but file not found. Skipping incorrect sample export.")
+        
         # 构建完整结果
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         full_results = {
             'timestamp': timestamp,
             'dataset': {
@@ -133,6 +200,18 @@ class EvaluationPipeline:
             },
             'metrics': eval_results
         }
+        
+        artifacts = {}
+        if inference_enabled and inference_file_exists:
+            artifacts['inference_output_file'] = inferoutput_path
+        if incorrect_file_path:
+            artifacts['incorrect_samples_file'] = incorrect_file_path
+            artifacts['incorrect_count'] = len(incorrect_samples)
+        elif save_incorrect and inference_enabled:
+            artifacts['incorrect_samples_file'] = None
+            artifacts['incorrect_count'] = len(incorrect_samples)
+        if artifacts:
+            full_results['artifacts'] = artifacts
         
         if save_results:
             # 保存 JSON 结果

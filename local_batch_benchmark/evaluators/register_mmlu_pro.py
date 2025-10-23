@@ -13,7 +13,6 @@ def mmlu_pro_evaluator(
     data: List[Dict],
     batch_size: int = 64,
     max_length: int = 1,  # MMLU-Pro 只需要生成一个字母
-    noise: float = 0.0,
     use_cot: bool = False,
     inferoutput: str = None,  # 保存推理结果的路径
     **kwargs
@@ -25,6 +24,12 @@ def mmlu_pro_evaluator(
     print(f"\n=== Running MMLU Pro Evaluation ===")
     print(f"Total samples: {len(data)}")
     print(f"Batch size: {batch_size}")
+    
+    cot_detected = use_cot or any(
+        "<think>" in item.get("prompt", "")
+        for item in data[: min(len(data), 8)]
+    )
+    use_cot = cot_detected
     print(f"Use CoT: {use_cot}")
     if inferoutput:
         print(f"Inference output will be saved to: {inferoutput}\n")
@@ -47,7 +52,7 @@ def mmlu_pro_evaluator(
         prompts = [item['prompt'] for item in batch]
         
         # 生成
-        tokens, _ = engine.generate_batch(prompts, max_length=max_length, noise=noise)
+        tokens, _ = engine.generate_batch(prompts, max_length=max_length)
         predictions = engine.decode_tokens(tokens)
         
         # 评估每个样本

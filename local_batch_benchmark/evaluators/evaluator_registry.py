@@ -3,6 +3,8 @@ Evaluator Registry - 评估器注册器
 支持注册不同的评估方法和指标计算
 """
 
+import json
+import os
 import numpy as np
 import torch
 from typing import List, Dict, Callable, Optional, Any
@@ -95,6 +97,7 @@ def exact_match_evaluator(
     batch_size: int = 128,
     max_length: int = 100,
     noise: float = 0.0,
+    inferoutput: Optional[str] = None,
     **kwargs
 ) -> Dict[str, float]:
     """
@@ -107,6 +110,7 @@ def exact_match_evaluator(
     
     correct = 0
     total = 0
+    inference_records: List[Dict[str, Any]] = []
     
     # 批量处理
     for i in range(0, len(data), batch_size):
@@ -119,17 +123,37 @@ def exact_match_evaluator(
         predictions = engine.decode_tokens(tokens)
         
         # 评估
-        for pred, ref in zip(predictions, references):
+        for idx, (pred, ref) in enumerate(zip(predictions, references)):
             pred_clean = pred.strip().lower()
             ref_clean = ref.strip().lower()
-            if pred_clean == ref_clean:
+            is_correct = pred_clean == ref_clean
+            if is_correct:
                 correct += 1
             total += 1
+            
+            if inferoutput:
+                record = {
+                    'prompt': prompts[idx],
+                    'prediction': pred,
+                    'reference': references[idx],
+                    'is_correct': is_correct
+                }
+                raw_data = batch[idx].get('raw')
+                if raw_data is not None:
+                    record['raw'] = raw_data
+                inference_records.append(record)
         
         if (i // batch_size + 1) % 10 == 0:
             print(f"Processed {total}/{len(data)} samples, accuracy: {correct/total*100:.2f}%")
     
     accuracy = correct / total if total > 0 else 0
+    
+    if inferoutput:
+        os.makedirs(os.path.dirname(inferoutput) or '.', exist_ok=True)
+        with open(inferoutput, 'w', encoding='utf-8') as f:
+            for item in inference_records:
+                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+        print(f"\n✓ Saved inference details to {inferoutput}")
     
     results = {
         'accuracy': accuracy,
@@ -147,6 +171,7 @@ def perplexity_evaluator(
     batch_size: int = 256,
     pad_eod: bool = True,
     print_interval: int = 1000,
+    inferoutput: Optional[str] = None,
     **kwargs
 ) -> Dict[str, float]:
     """
@@ -161,8 +186,9 @@ def perplexity_evaluator(
     xcnt = 0
     xacc = 0
     
-    fwd_tokens = []
-    fwd_desc = []
+    fwd_tokens: List[List[int]] = []
+    fwd_desc: List[Dict[str, Any]] = []
+    inference_records: List[Dict[str, Any]] = []
     
     for i in range(len(data)):
         item = data[i]
@@ -187,7 +213,13 @@ def perplexity_evaluator(
         
         # 存储任务
         fwd_tokens.append(src + dst)
-        fwd_desc.append((src, dst))
+        fwd_desc.append({
+            'src': list(src),
+            'dst': list(dst),
+            'item': item,
+            'prompt_text': src_text,
+            'target_text': dst_text
+        })
         
         # 批量前向
         if len(fwd_tokens) >= batch_size or i == len(data) - 1:
@@ -200,20 +232,41 @@ def perplexity_evaluator(
             # 处理输出
             for j in range(len(fwd_desc)):
                 out = out_batch[j]
-                src, dst = fwd_desc[j]
+                desc = fwd_desc[j]
+                src = desc['src']
+                dst = desc['dst']
                 
                 logits = 0
                 correct = True
+                predicted_ids: List[int] = []
                 for n in range(len(dst)):
                     ooo = out[len(src) - 1 + n].float()
                     probs = F.softmax(ooo, dim=-1)
                     logits += np.log(probs[dst[n]].item())
-                    if torch.argmax(probs).item() != dst[n]:
+                    top_token = torch.argmax(probs).item()
+                    predicted_ids.append(top_token)
+                    if top_token != dst[n]:
                         correct = False
                 
                 xcnt += 1
                 xsum += logits
                 xacc += 1 if correct else 0
+                
+                if inferoutput:
+                    prompt_text = desc['prompt_text']
+                    target_text = desc['target_text']
+                    predicted_text = engine.tokenizer.decode(predicted_ids) if predicted_ids else ""
+                    record = {
+                        'prompt': prompt_text,
+                        'reference': target_text,
+                        'predicted': predicted_text,
+                        'logprob_sum': float(logits),
+                        'is_correct': correct
+                    }
+                    raw_data = desc['item'].get('raw')
+                    if raw_data is not None:
+                        record['raw'] = raw_data
+                    inference_records.append(record)
                 
                 if xcnt % print_interval == 0 or xcnt == len(data):
                     ppl = np.exp(-xsum / xcnt)
@@ -236,6 +289,13 @@ def perplexity_evaluator(
     print(f"  Perplexity: {ppl:.2f}")
     print(f"  Accuracy: {acc*100:.1f}%")
     
+    if inferoutput:
+        os.makedirs(os.path.dirname(inferoutput) or '.', exist_ok=True)
+        with open(inferoutput, 'w', encoding='utf-8') as f:
+            for item in inference_records:
+                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+        print(f"✓ Saved inference details to {inferoutput}")
+    
     return results
 
 
@@ -247,6 +307,7 @@ def generation_evaluator(
     noise: float = 0.0,
     save_outputs: bool = True,
     output_file: str = None,
+    inferoutput: Optional[str] = None,
     **kwargs
 ) -> Dict[str, float]:
     """
@@ -261,6 +322,10 @@ def generation_evaluator(
     all_outputs = []
     total_tokens = 0
     total_time = 0
+    
+    if inferoutput:
+        save_outputs = True
+        output_file = inferoutput
     
     # 批量处理
     for i in range(0, len(data), batch_size):
@@ -296,10 +361,13 @@ def generation_evaluator(
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = f"generation_outputs_{timestamp}.jsonl"
         
-        import json
+        os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
         with open(output_file, 'w', encoding='utf-8') as f:
             for item in all_outputs:
-                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                record = dict(item)
+                if inferoutput:
+                    record.setdefault('is_correct', None)
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
         print(f"\n✓ Saved outputs to {output_file}")
     
     # 计算统计

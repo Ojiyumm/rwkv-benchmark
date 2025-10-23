@@ -14,8 +14,8 @@ import threading
 
 
 def test_lambada_via_api(
-    api_url: str = "http://192.168.0.82:8000",
-    lambada_path: str = "/home/rwkv/Peter/Albatross/eval/lambada_test.jsonl",
+    api_url: str = "http://0.0.0.0:16384",
+    lambada_path: str = "/public/home/ssjxzkz/Projects/rwkv-benchmark/eval/lambada_test.jsonl",
     max_samples: int = None,
     max_workers: int = 32
 ):
@@ -234,8 +234,8 @@ def quick_test(api_url: str = "http://localhost:8000"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LAMBADA Evaluation via API")
-    parser.add_argument("--api_url", type=str, default="http://192.168.0.82:8000", help="API server URL")
-    parser.add_argument("--lambada_path", type=str, default="/home/rwkv/Peter/Albatross/eval/lambada_test.jsonl", help="Path to LAMBADA dataset")
+    parser.add_argument("--api_url", type=str, default="http://10.100.1.98:16384", help="API server URL")
+    parser.add_argument("--lambada_path", type=str, default="/public/home/ssjxzkz/Projects/rwkv-benchmark/eval/lambada_test.jsonl", help="Path to LAMBADA dataset")
     parser.add_argument("--max_samples", type=int, default=None, help="Max samples to test (default: all)")
     parser.add_argument("--max_workers", type=int, default=32, help="Number of concurrent workers")
     parser.add_argument("--quick_test", action="store_true", help="Run quick API test only")

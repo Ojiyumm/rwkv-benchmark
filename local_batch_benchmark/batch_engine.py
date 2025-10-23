@@ -20,7 +20,48 @@ from torch.nn import functional as F
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from reference.rwkv7 import RWKV_x070
-from reference.utils import TRIE_TOKENIZER, sampler_simple_batch
+from reference.utils import TRIE_TOKENIZER, sampler_simple_batch, sample_logits_batch
+
+
+class SamplingConfig:
+    """
+    统一的采样超参数配置类
+    """
+    def __init__(
+        self,
+        temperature: float = 0.5,
+        max_generate_tokens: int = 4096,
+        top_k: int = 50,
+        top_p: float = 0.3,
+        pad_zero: bool = True,
+        alpha_presence: float = 1.0,
+        alpha_frequency: float = 0.1,
+        alpha_decay: float = 0.99,
+        stop_tokens: Optional[List[int]] = None
+    ):
+        self.temperature = temperature
+        self.max_generate_tokens = max_generate_tokens
+        self.top_k = top_k
+        self.top_p = top_p
+        self.pad_zero = pad_zero
+        self.alpha_presence = alpha_presence
+        self.alpha_frequency = alpha_frequency
+        self.alpha_decay = alpha_decay
+        self.stop_tokens = list(stop_tokens) if stop_tokens is not None else [0]
+
+    def to_dict(self):
+        """转换为字典格式"""
+        return {
+            "temperature": self.temperature,
+            "max_generate_tokens": self.max_generate_tokens,
+            "top_k": self.top_k,
+            "top_p": self.top_p,
+            "pad_zero": self.pad_zero,
+            "alpha_presence": self.alpha_presence,
+            "alpha_frequency": self.alpha_frequency,
+            "alpha_decay": self.alpha_decay,
+            "stop_tokens": self.stop_tokens
+        }
 
 
 class RWKVInferenceEngine:
@@ -35,89 +76,152 @@ class RWKVInferenceEngine:
         vocab_path: Optional[str] = None,
         vocab_size: int = 65536,
         head_size: int = 64,
-        seed: int = 42
+        seed: int = 42,
+        sampling_config: Optional[SamplingConfig] = None
     ):
         """
         初始化推理引擎
-        
+
         Args:
             model_path: 模型路径
             vocab_path: 词汇表路径
             vocab_size: 词汇表大小
             head_size: 注意力头大小
             seed: 随机种子
+            sampling_config: 采样配置对象（可选，使用默认值如未提供）
         """
         # 设置随机种子
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
-        
+
+        # 初始化采样配置
+        self.sampling_config = sampling_config or SamplingConfig()
+
         # 初始化模型参数
         args = types.SimpleNamespace()
         args.vocab_size = vocab_size
         args.head_size = head_size
         args.MODEL_NAME = model_path
-        
+
         print(f'\nLoading RWKV model from {model_path}...')
         self.model = RWKV_x070(args)
         print(f'Model loaded successfully!\n')
-        
+
         # 初始化tokenizer
         if vocab_path is None:
             vocab_path = os.path.join(os.path.dirname(__file__), "..", "reference", "rwkv_vocab_v20230424.txt")
         self.tokenizer = TRIE_TOKENIZER(vocab_path)
+
+        # 初始化token计数追踪器（用于重复惩罚）
+        self.token_counts = None
         
     def generate_batch(
         self,
         prompts: List[str],
-        max_length: int = 100,
-        noise: float = 0.0
+        max_length: int = None,
+        noise: float = None,
+        override_config: Optional[SamplingConfig] = None
     ) -> Tuple[np.ndarray, float]:
         """
         批量生成文本
-        
+
         Args:
             prompts: 提示列表
-            max_length: 最大生成长度
-            noise: 采样噪声
-            
+            max_length: 最大生成长度（可选，覆盖配置中的值）
+            noise: 采样噪声（已弃用，保持兼容性）
+            override_config: 临时覆盖的采样配置
+
         Returns:
             tokens: numpy数组，形状为 (batch_size, max_length)
             inference_time: 推理总时间（秒）
         """
+        # 选择使用的配置
+        config = override_config or self.sampling_config
+
+        # 确定最大生成长度
+        if max_length is not None:
+            actual_max_length = max_length
+        else:
+            actual_max_length = config.max_generate_tokens
+
         batch_size = len(prompts)
-        
+        vocab_size = getattr(self.model, 'vocab_size', 65536)
+
         # 初始化状态
         state = self.model.generate_zero_state(batch_size)
-        
+
         # Prefill阶段
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-        
+
         out = self.model.forward_batch(
             [self.tokenizer.encode(prompt) for prompt in prompts],
             state
         )
-        
-        # Decode阶段 - 参考batch.py的实现
+
+        # 初始化token计数（用于重复惩罚） - 放在forward之后获取设备
+        if config.alpha_presence > 0.0 or config.alpha_frequency > 0.0:
+            # 从输出tensor获取设备（torch.jit模型兼容）
+            device = out.device if hasattr(out, 'device') else out[0].device
+            self.token_counts = torch.zeros((batch_size, vocab_size), device=device)
+        else:
+            self.token_counts = None
+
+        # Decode阶段 - 使用高级采样器
         tokens = []
-        for i in range(max_length):
-            # Sample - 返回形状为 (batch_size, 1) 的tensor
-            new_tokens = sampler_simple_batch(out, noise=noise).tolist()
-            tokens.append(new_tokens)
+        for i in range(actual_max_length):
+            # 使用高级批量采样器
+            new_tokens = sample_logits_batch(
+                logits=out,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                top_k=config.top_k,
+                alpha_presence=config.alpha_presence,
+                alpha_frequency=config.alpha_frequency,
+                token_counts=self.token_counts
+            )
+
+            # 更新token计数用于重复惩罚
+            if self.token_counts is not None:
+                # 增加已生成token的计数
+                for batch_idx in range(batch_size):
+                    token_id = new_tokens[batch_idx, 0].item()
+                    self.token_counts[batch_idx, token_id] += 1
+
+                # 应用衰减因子
+                if config.alpha_decay < 1.0:
+                    self.token_counts *= config.alpha_decay
+
+            tokens.append(new_tokens.tolist())
+
+            # 检查是否遇到停止token
+            if config.stop_tokens:
+                # 从new_tokens tensor获取设备
+                device = new_tokens.device
+                stop_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                for batch_idx in range(batch_size):
+                    token_id = new_tokens[batch_idx, 0].item()
+                    if token_id in config.stop_tokens:
+                        stop_mask[batch_idx] = True
+
+                # 如果所有样本都遇到停止token，提前结束
+                if stop_mask.all():
+                    break
+
             # Forward
-            out = self.model.forward_batch(new_tokens, state)
-        
+            out = self.model.forward_batch(new_tokens.tolist(), state)
+
         torch.cuda.synchronize()
         inference_time = time.perf_counter() - start_time
-        
+
         # 转换为numpy数组并整理维度
         # tokens: list of [batch_size, 1] -> (max_length, batch_size, 1)
         # transpose -> (batch_size, max_length, 1)
         # squeeze(-1) -> (batch_size, max_length)
         tokens = np.transpose(np.array(tokens), axes=(1, 0, 2)).squeeze(-1)
-        
+
         return tokens, inference_time
     
     def decode_tokens(
@@ -148,49 +252,69 @@ class RWKVInferenceEngine:
     def generate_with_logprobs(
         self,
         prompts: List[str],
-        max_length: int = 100,
+        max_length: int = None,
         echo: bool = False,
-        top_logprobs: int = 1
+        top_logprobs: int = 1,
+        override_config: Optional[SamplingConfig] = None
     ):
         """
         批量生成文本并返回logprobs信息（参考batch.py的高效batch实现）
         支持多个prompt的batch推理（变长序列）
-        
+
         Args:
             prompts: 输入提示列表
-            max_length: 最大生成长度  
+            max_length: 最大生成长度（可选，覆盖配置中的值）
             echo: 是否包含prompt的logprobs
             top_logprobs: 返回top-N logprobs
-            
+            override_config: 临时覆盖的采样配置
+
         Returns:
             字典列表，每个包含tokens, logprobs等信息
         """
+        # 选择使用的配置
+        config = override_config or self.sampling_config
+
+        # 确定最大生成长度
+        if max_length is not None:
+            actual_max_length = max_length
+        else:
+            actual_max_length = config.max_generate_tokens
+
         batch_size = len(prompts)
+        vocab_size = getattr(self.model, 'vocab_size', 65536)
         state = self.model.generate_zero_state(batch_size)
-        
+
         # Encode所有prompts
         prompt_tokens_list = [self.tokenizer.encode(prompt) for prompt in prompts]
-        
+
         results = []
-        
+
         # 如果echo=True，使用full_output=True一次性forward所有prompts（变长batch）
         if echo:
             # 使用batch forward，支持变长序列
             full_outputs = self.model.forward_batch(prompt_tokens_list, state, full_output=True)
-            
+
+            # 初始化token计数（用于重复惩罚） - 从full_outputs获取设备
+            if config.alpha_presence > 0.0 or config.alpha_frequency > 0.0:
+                # 从输出tensor获取设备
+                device = full_outputs[0].device if hasattr(full_outputs[0], 'device') else full_outputs[0][0].device
+                token_counts = torch.zeros((batch_size, vocab_size), device=device)
+            else:
+                token_counts = None
+
             for batch_idx in range(batch_size):
                 prompt_tokens = prompt_tokens_list[batch_idx]
                 full_output = full_outputs[batch_idx]
-                
+
                 all_tokens = []
                 all_logprobs = []
                 all_top_logprobs = []
-                
+
                 # 对prompt tokens计算logprobs
                 for i in range(len(prompt_tokens)):
                     token = prompt_tokens[i]
                     all_tokens.append(token)
-                    
+
                     if i == 0:
                         # 第一个token，没有前序预测，logprob设为0
                         all_logprobs.append(0.0)
@@ -199,10 +323,10 @@ class RWKVInferenceEngine:
                         # 使用前一个位置的输出来预测当前token
                         logits = full_output[i-1].float()
                         log_probs = F.log_softmax(logits, dim=-1)
-                        
+
                         token_logprob = log_probs[token].item()
                         all_logprobs.append(token_logprob)
-                        
+
                         # Top logprobs
                         top_lp, top_idx = torch.topk(log_probs, min(top_logprobs, len(log_probs)))
                         top_dict = {}
@@ -210,7 +334,7 @@ class RWKVInferenceEngine:
                             token_str = self.tokenizer.decode([ti], utf8_errors="ignore")
                             top_dict[token_str] = lp
                         all_top_logprobs.append(top_dict)
-                
+
                 # 准备生成的初始输出（最后一个位置）
                 results.append({
                     'all_tokens': all_tokens,
@@ -221,6 +345,15 @@ class RWKVInferenceEngine:
         else:
             # 不echo，只forward prompts不记录logprobs
             outs = self.model.forward_batch(prompt_tokens_list, state)
+
+            # 初始化token计数（用于重复惩罚） - 从outs获取设备
+            if config.alpha_presence > 0.0 or config.alpha_frequency > 0.0:
+                # 从输出tensor获取设备
+                device = outs[0].device if hasattr(outs[0], 'device') else outs.device
+                token_counts = torch.zeros((batch_size, vocab_size), device=device)
+            else:
+                token_counts = None
+
             for batch_idx in range(batch_size):
                 results.append({
                     'all_tokens': [],
@@ -228,25 +361,44 @@ class RWKVInferenceEngine:
                     'all_top_logprobs': [],
                     'last_out': outs[batch_idx]
                 })
-        
+
         # Generate new tokens（batch方式）
-        for _ in range(max_length):
+        for _ in range(actual_max_length):
             # 收集当前batch所有的输出
             batch_outs = torch.stack([r['last_out'] for r in results])
             log_probs_batch = F.log_softmax(batch_outs.float(), dim=-1)
-            
-            # Sample new tokens for all in batch
-            new_tokens = sampler_simple_batch(batch_outs, noise=0.0).tolist()
-            
+
+            # 使用高级批量采样器
+            new_tokens = sample_logits_batch(
+                logits=batch_outs,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                top_k=config.top_k,
+                alpha_presence=config.alpha_presence,
+                alpha_frequency=config.alpha_frequency,
+                token_counts=token_counts
+            )
+
+            # 更新token计数用于重复惩罚
+            if token_counts is not None:
+                # 增加已生成token的计数
+                for batch_idx in range(batch_size):
+                    token_id = new_tokens[batch_idx, 0].item()
+                    token_counts[batch_idx, token_id] += 1
+
+                # 应用衰减因子
+                if config.alpha_decay < 1.0:
+                    token_counts *= config.alpha_decay
+
             # 记录每个样本的token和logprob
             for batch_idx in range(batch_size):
-                new_token = new_tokens[batch_idx][0]
+                new_token = new_tokens[batch_idx, 0].item()
                 log_probs = log_probs_batch[batch_idx]
                 token_logprob = log_probs[new_token].item()
-                
+
                 results[batch_idx]['all_tokens'].append(new_token)
                 results[batch_idx]['all_logprobs'].append(token_logprob)
-                
+
                 # Top logprobs
                 top_lp, top_idx = torch.topk(log_probs, min(top_logprobs, len(log_probs)))
                 top_dict = {}
@@ -254,26 +406,40 @@ class RWKVInferenceEngine:
                     token_str = self.tokenizer.decode([ti], utf8_errors="ignore")
                     top_dict[token_str] = lp
                 results[batch_idx]['all_top_logprobs'].append(top_dict)
-            
+
+            # 检查是否遇到停止token
+            if config.stop_tokens:
+                # 从new_tokens tensor获取设备
+                device = new_tokens.device
+                stop_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                for batch_idx in range(batch_size):
+                    token_id = new_tokens[batch_idx, 0].item()
+                    if token_id in config.stop_tokens:
+                        stop_mask[batch_idx] = True
+
+                # 如果所有样本都遇到停止token，提前结束
+                if stop_mask.all():
+                    break
+
             # Batch forward
-            new_tokens_for_forward = [[t[0]] for t in new_tokens]
+            new_tokens_for_forward = [[t[0]] for t in new_tokens.tolist()]
             outs = self.model.forward_batch(new_tokens_for_forward, state)
             for batch_idx in range(batch_size):
                 results[batch_idx]['last_out'] = outs[batch_idx]
-        
+
         # 最终格式化输出
         final_results = []
         for batch_idx in range(batch_size):
             all_tokens = results[batch_idx]['all_tokens']
             all_logprobs = results[batch_idx]['all_logprobs']
             all_top_logprobs = results[batch_idx]['all_top_logprobs']
-            
+
             # Decode all tokens
             token_strs = []
             for token in all_tokens:
                 token_str = self.tokenizer.decode([token], utf8_errors="ignore")
                 token_strs.append(token_str)
-            
+
             final_results.append({
                 'tokens': all_tokens,
                 'token_strs': token_strs,
@@ -281,7 +447,7 @@ class RWKVInferenceEngine:
                 'top_logprobs': all_top_logprobs,
                 'text': ''.join(token_strs)
             })
-        
+
         return final_results
     
     def analyze_next_token(
@@ -395,8 +561,7 @@ class RWKVInferenceEngine:
         start_time = time.time()
         tokens, inference_time = self.generate_batch(
             prompts=prompts,
-            max_length=max_length,
-            noise=0.0
+            max_length=max_length
         )
         responses = self.decode_tokens(tokens)
         
@@ -454,40 +619,82 @@ class RWKVInferenceEngine:
 if __name__ == "__main__":
     # 简单测试：加载模型并生成
     import sys
-    
+
     print("Testing RWKV Inference Engine...")
-    
+
     # 从环境变量或命令行参数获取模型路径
     model_path = os.getenv("MODEL_PATH", "/home/rwkv/models/rwkv7/rwkv7-g1-0.4b-20250324-ctx4096")
     if len(sys.argv) > 1:
         model_path = sys.argv[1]
-    
+
     print(f"Model path: {model_path}")
-    
+
+    # 创建用户指定的超参数配置
+    custom_config = SamplingConfig(
+        temperature=0.5,
+        max_generate_tokens=4096,
+        top_k=50,
+        top_p=0.3,
+        pad_zero=True,
+        alpha_presence=1.0,
+        alpha_frequency=0.1,
+        alpha_decay=0.99,
+        stop_tokens=[0, 261, 24281]
+    )
+
+    print(f"\nUsing custom sampling configuration:")
+    print(f"  Temperature: {custom_config.temperature}")
+    print(f"  Top-K: {custom_config.top_k}")
+    print(f"  Top-P: {custom_config.top_p}")
+    print(f"  Alpha Presence: {custom_config.alpha_presence}")
+    print(f"  Alpha Frequency: {custom_config.alpha_frequency}")
+    print(f"  Alpha Decay: {custom_config.alpha_decay}")
+    print(f"  Stop Tokens: {custom_config.stop_tokens}")
+
     engine = RWKVInferenceEngine(
         model_path=model_path,
-        seed=42
+        seed=42,
+        sampling_config=custom_config
     )
-    
-    # 测试生成
+
+    # 测试生成（使用新的配置）
     prompts = ["The", "Hello", "今天天气"]
-    print(f"\nTesting batch generation with {len(prompts)} prompts...")
-    tokens, inference_time = engine.generate_batch(prompts, max_length=20, noise=0.0)
+    print(f"\nTesting batch generation with {len(prompts)} prompts using advanced sampling...")
+    tokens, inference_time = engine.generate_batch(prompts, max_length=20)
     texts = engine.decode_tokens(tokens)
-    
+
     print(f"\nResults:")
     print(f"  Inference time: {inference_time:.4f}s")
     print(f"  Throughput: {tokens.size/inference_time:.2f} tokens/s")
-    
+
     for prompt, text in zip(prompts, texts):
         print(f"\n  Prompt: {prompt}")
         print(f"  Generated: {text}")
-    
+
+    # 测试向后兼容性：使用默认配置
+    print(f"\n{'='*80}")
+    print("Testing backward compatibility with default config...")
+    print(f"{'='*80}")
+
+    engine_default = RWKVInferenceEngine(
+        model_path=model_path,
+        seed=42
+        # 不传递 sampling_config，使用默认配置
+    )
+
+    print(f"Default config - Temperature: {engine_default.sampling_config.temperature}")
+    tokens_default, _ = engine_default.generate_batch(prompts, max_length=10)
+    texts_default = engine_default.decode_tokens(tokens_default)
+
+    print("Generated with default config:")
+    for prompt, text in zip(prompts, texts_default):
+        print(f"  {prompt} -> {text}")
+
     # 测试保存功能
     print(f"\n{'='*80}")
     print("Testing save_qa_to_jsonl...")
     print(f"{'='*80}")
-    
+
     test_prompts = ["The capital of France is", "1+1=", "今天天气"]
     responses, saved_file = engine.generate_and_save(
         prompts=test_prompts,
@@ -495,11 +702,14 @@ if __name__ == "__main__":
         max_length=10,
         output_dir="./results",
         save_tokens=False,
-        metadata={"model": "rwkv7-0.4b", "test": True}
+        metadata={"model": "rwkv7-0.4b", "test": True, "config": custom_config.to_dict()}
     )
-    
+
     print(f"\nSaved to: {saved_file}")
     print(f"Generated {len(responses)} responses")
-    
-    print("\nEngine test completed! Use test.py for full test suite.")
+
+    print("\nEngine test completed! Advanced sampling with hyperparameters is now available.")
+    print("\nTo use custom config:")
+    print("  config = SamplingConfig(temperature=0.7, top_k=40, top_p=0.9)")
+    print("  engine = RWKVInferenceEngine(model_path, sampling_config=config)")
 
