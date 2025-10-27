@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 运行 MMLU Pro 评估
-MMLU Pro 会在导入 tasks 模块时自动注册
+MMLU Pro 会在导入 datasets 模块时自动注册
 """
 
 import sys
@@ -56,11 +56,6 @@ def main():
         default='./eval_results',
         help='Output directory'
     )
-    parser.add_argument(
-        '--inferoutput',
-        type=str,
-        help='Path to save inference results (questions and answers) in JSONL format'
-    )
     
     args = parser.parse_args()
     
@@ -79,10 +74,6 @@ def main():
     print("="*80 + "\n")
     
     # 运行评估
-    eval_kwargs = {}
-    if args.inferoutput:
-        eval_kwargs['inferoutput'] = args.inferoutput
-    
     results = quick_eval(
         model_path=args.model_path,
         dataset_name=dataset_name,
@@ -91,8 +82,7 @@ def main():
         batch_size=args.batch_size,
         max_length=args.max_length,
         limit=args.limit,
-        use_cot=args.cot,
-        **eval_kwargs
+        use_cot=args.cot
     )
     
     # 打印结果摘要

@@ -72,8 +72,9 @@ class RWKVInferenceEngine:
         self,
         prompts: List[str],
         max_length: int = 100,
-        noise: float = 0.0
-    ) -> Tuple[np.ndarray, float]:
+        noise: float = 0.0,
+        return_speed: bool = False
+    ) -> Tuple[np.ndarray, float, Optional[Dict]]:
         """
         批量生成文本
         
@@ -81,10 +82,12 @@ class RWKVInferenceEngine:
             prompts: 提示列表
             max_length: 最大生成长度
             noise: 采样噪声
+            return_speed: 是否返回速度统计（和 benchmark.py 一样的计算方法）
             
         Returns:
             tokens: numpy数组，形状为 (batch_size, max_length)
             inference_time: 推理总时间（秒）
+            speed_stats: 速度统计字典（仅当 return_speed=True）
         """
         batch_size = len(prompts)
         
@@ -102,14 +105,26 @@ class RWKVInferenceEngine:
         
         # Decode阶段 - 参考batch.py的实现
         tokens = []
+        times = []
+        all_times = []
+        
         for i in range(max_length):
+            t00 = time.perf_counter()
+            
             # Sample - 返回形状为 (batch_size, 1) 的tensor
             new_tokens = sampler_simple_batch(out, noise=noise).tolist()
             tokens.append(new_tokens)
-            # Forward
+            
+            # Forward（和 benchmark.py 一样记录时间）
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
             out = self.model.forward_batch(new_tokens, state)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            
+            times.append(t1 - t0)
+            all_times.append(t1 - t00)
         
-        torch.cuda.synchronize()
         inference_time = time.perf_counter() - start_time
         
         # 转换为numpy数组并整理维度
@@ -118,7 +133,23 @@ class RWKVInferenceEngine:
         # squeeze(-1) -> (batch_size, max_length)
         tokens = np.transpose(np.array(tokens), axes=(1, 0, 2)).squeeze(-1)
         
-        return tokens, inference_time
+        # 计算速度统计（和 benchmark.py 一样）
+        speed_stats = None
+        if return_speed:
+            times = np.array(times)
+            all_times = np.array(all_times)
+            time_p50 = np.percentile(times, 50)
+            all_time_p50 = np.percentile(all_times, 50)
+            
+            speed_stats = {
+                'batch_size': batch_size,
+                'forward_tps': batch_size / time_p50,
+                'full_tps': batch_size / all_time_p50,
+                'step_forward_ms_p50': time_p50 * 1000,
+                'step_full_ms_p50': all_time_p50 * 1000
+            }
+        
+        return tokens, inference_time, speed_stats
     
     def decode_tokens(
         self,
@@ -393,7 +424,7 @@ class RWKVInferenceEngine:
         
         # 生成回答
         start_time = time.time()
-        tokens, inference_time = self.generate_batch(
+        tokens, inference_time, _ = self.generate_batch(
             prompts=prompts,
             max_length=max_length,
             noise=0.0
@@ -449,6 +480,73 @@ class RWKVInferenceEngine:
         print(f"Throughput: {len(prompts)/total_time:.2f} samples/s")
         
         return responses, filepath
+    
+    def measure_decode_speed(
+        self,
+        batch_size: int = 128,
+        length: int = 32,
+        percentile: int = 50
+    ) -> Dict[str, float]:
+        """
+        测量 batch decode 速度（完全复现 benchmark.py）
+        
+        Args:
+            batch_size: 批量大小
+            length: 生成长度
+            percentile: 百分位数（用于统计）
+            
+        Returns:
+            速度统计字典
+        """
+        import gc
+        
+        # 双重清理显存（和 benchmark.py 一样）
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # 准备测试数据（和 benchmark.py 一样）
+        prompts = ["The apple can be" for _ in range(batch_size)]
+        tokens_list = [self.tokenizer.encode(prompt) for prompt in prompts]
+        
+        # 初始化 state
+        state = self.model.generate_zero_state(batch_size)
+        
+        # Prefill
+        out = self.model.forward_batch(tokens_list, state)
+        
+        # Decode 并测速（和 benchmark.py 一样）
+        times = []
+        all_times = []
+        
+        for _ in range(length):
+            t00 = time.perf_counter()
+            token = sampler_simple_batch(out, noise=0.0).tolist()
+            
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            out = self.model.forward_batch(token, state)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            
+            times.append(t1 - t0)
+            all_times.append(t1 - t00)
+        
+        # 计算统计数据（和 benchmark.py 一样）
+        times = np.array(times)
+        all_times = np.array(all_times)
+        
+        time_p50 = np.percentile(times, percentile)
+        all_time_p50 = np.percentile(all_times, percentile)
+        
+        return {
+            'batch_size': batch_size,
+            'forward_tps': batch_size / time_p50,       # tokens/s (forward only)
+            'full_tps': batch_size / all_time_p50,      # tokens/s (full pipeline)
+            'step_forward_ms_p50': time_p50 * 1000,
+            'step_full_ms_p50': all_time_p50 * 1000
+        }
 
 
 if __name__ == "__main__":
@@ -472,12 +570,13 @@ if __name__ == "__main__":
     # 测试生成
     prompts = ["The", "Hello", "今天天气"]
     print(f"\nTesting batch generation with {len(prompts)} prompts...")
-    tokens, inference_time = engine.generate_batch(prompts, max_length=20, noise=0.0)
+    tokens, inference_time, speed_stats = engine.generate_batch(prompts, max_length=20, noise=0.0, return_speed=True)
     texts = engine.decode_tokens(tokens)
     
     print(f"\nResults:")
     print(f"  Inference time: {inference_time:.4f}s")
-    print(f"  Throughput: {tokens.size/inference_time:.2f} tokens/s")
+    if speed_stats:
+        print(f"  Speed (benchmark method): forward {speed_stats['forward_tps']:.2f} tok/s, full {speed_stats['full_tps']:.2f} tok/s")
     
     for prompt, text in zip(prompts, texts):
         print(f"\n  Prompt: {prompt}")

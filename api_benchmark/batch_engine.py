@@ -87,6 +87,7 @@ class RWKVInferenceEngine:
             inference_time: 推理总时间（秒）
         """
         batch_size = len(prompts)
+        print(f"    [BatchEngine] generate_batch called with batch_size={batch_size}, max_length={max_length}")
         
         # 初始化状态
         state = self.model.generate_zero_state(batch_size)
@@ -102,15 +103,39 @@ class RWKVInferenceEngine:
         
         # Decode阶段 - 参考batch.py的实现
         tokens = []
+        finished = [False] * batch_size  # 追踪每个序列是否完成
+        END_TOKEN_ID = 0  # <|endoftext|> token ID
+        
         for i in range(max_length):
             # Sample - 返回形状为 (batch_size, 1) 的tensor
             new_tokens = sampler_simple_batch(out, noise=noise).tolist()
+            
+            # 检查停止标记：如果序列已完成，用 END_TOKEN_ID 填充
+            for b_idx in range(batch_size):
+                if finished[b_idx]:
+                    new_tokens[b_idx][0] = END_TOKEN_ID
+                elif new_tokens[b_idx][0] == END_TOKEN_ID:
+                    finished[b_idx] = True
+            
             tokens.append(new_tokens)
+            
+            # 如果所有序列都完成，提前退出
+            if all(finished):
+                print(f"    [BatchEngine] All sequences finished at step {i+1}/{max_length}")
+                break
+            
             # Forward
             out = self.model.forward_batch(new_tokens, state)
         
         torch.cuda.synchronize()
         inference_time = time.perf_counter() - start_time
+        
+        # 如果提前停止，用 END_TOKEN_ID 填充剩余位置
+        actual_length = len(tokens)
+        if actual_length < max_length:
+            # 每个时间步需要 batch_size 个 [token]
+            for _ in range(max_length - actual_length):
+                tokens.append([[END_TOKEN_ID] for _ in range(batch_size)])
         
         # 转换为numpy数组并整理维度
         # tokens: list of [batch_size, 1] -> (max_length, batch_size, 1)

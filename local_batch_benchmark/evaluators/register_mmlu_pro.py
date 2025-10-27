@@ -38,7 +38,7 @@ def mmlu_pro_evaluator(
     
     option_labels = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']
     
-    # 批量处理 - 使用 tqdm 显示进度
+    # 批量处理 - 使用 tqdm 显示进度（显存管理已在 batch_engine.py 层面处理）
     num_batches = (len(data) + batch_size - 1) // batch_size
     pbar = tqdm(total=len(data), desc="Evaluating MMLU-Pro", unit="samples")
     
@@ -47,7 +47,7 @@ def mmlu_pro_evaluator(
         prompts = [item['prompt'] for item in batch]
         
         # 生成
-        tokens, _ = engine.generate_batch(prompts, max_length=max_length, noise=noise)
+        tokens, _, _ = engine.generate_batch(prompts, max_length=max_length, noise=noise)
         predictions = engine.decode_tokens(tokens)
         
         # 评估每个样本

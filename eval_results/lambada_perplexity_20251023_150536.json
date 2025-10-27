@@ -1,0 +1,23 @@
+{
+  "timestamp": "20251023_150536",
+  "dataset": {
+    "name": "lambada",
+    "path": "/home/rwkv/Peter/Albatross/eval/lambada_test.jsonl",
+    "size": 5153,
+    "limit": null
+  },
+  "evaluator": "perplexity",
+  "config": {
+    "batch_size": 256,
+    "max_length": 1
+  },
+  "metrics": {
+    "perplexity": 6.9244067099537645,
+    "accuracy": 0.5930525907238502,
+    "total": 5153,
+    "forward_tps": 14626.31,
+    "full_tps": 14544.32,
+    "step_forward_ms_p50": 17.503,
+    "step_full_ms_p50": 17.601
+  }
+}

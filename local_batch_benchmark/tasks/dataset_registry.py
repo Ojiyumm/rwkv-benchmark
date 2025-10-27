@@ -165,7 +165,7 @@ DatasetRegistry.register(
     loader=load_jsonl,
     prompt_template=lambada_prompt,
     description='LAMBADA language modeling benchmark',
-    default_batch_size=256,
+    default_batch_size=64,  # 降低，因为 perplexity 用 full_output 会占用大量显存
     default_max_length=1
 )
 

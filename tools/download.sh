@@ -8,7 +8,7 @@ echo "======================================"
 echo ""
 
 # 配置环境变量
-export HF_TOKEN=""
+
 # 对于需要认证的数据集，不使用镜像，直接用官方源
 unset HF_ENDPOINT
 export HF_HUB_DOWNLOAD_TIMEOUT=600

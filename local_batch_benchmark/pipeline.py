@@ -112,6 +112,21 @@ class EvaluationPipeline:
             **eval_kwargs
         )
         
+        # 附加速度测量（与benchmark一致的batch解码环）
+        try:
+            speed = self.engine.measure_decode_speed(batch_size=batch_size, length=32)
+            print(f"\n[Speed] BSZ {int(speed['batch_size'])} || Token/s = {speed['forward_tps']:.2f} (forward), {speed['full_tps']:.2f} (full)")
+            # 合并进metrics，便于保存
+            eval_results = {
+                **eval_results,
+                'forward_tps': round(speed['forward_tps'], 2),
+                'full_tps': round(speed['full_tps'], 2),
+                'step_forward_ms_p50': round(speed['step_forward_ms_p50'], 3),
+                'step_full_ms_p50': round(speed['step_full_ms_p50'], 3)
+            }
+        except Exception as e:
+            print(f"[Speed] Measure failed: {e}")
+        
         # 3. 保存结果
         print(f"\n[3/3] Finalizing results")
         

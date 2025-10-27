@@ -41,9 +41,10 @@ def _parse_options(options) -> List[str]:
 
 
 def mmlu_pro_prompt(item: Dict) -> str:
+   
     question = item.get('question', '')
     options_raw = item.get('options', item.get('choices', []))
-    category = item.get('category', item.get('subject', 'professional knowledge'))
+    category = item.get('category', item.get('subject', ''))
     
     # 解析并过滤选项（移除空项）
     options = _parse_options(options_raw)
@@ -51,23 +52,17 @@ def mmlu_pro_prompt(item: Dict) -> str:
     # 构建选项字符串（只为实际存在的选项分配字母）
     option_labels = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']
     option_text = '\n'.join([
-        f"{option_labels[i]}. {opt}"
+        f"{option_labels[i]}. {opt}" 
         for i, opt in enumerate(options) if i < len(option_labels)
     ])
     
-    role_line = f"You are a very talented expert in {category}."
+    # 组合 prompt
+    if category:
+        prompt = f"Category: {category}\n\nUser: {question}\n{option_text}\n\nAssistant:"
+    else:
+        prompt = f"User: {question}\n{option_text}\n\nAssistant:"
     
-    return (
-        f"{role_line}\n"
-        "Carefully study the professional multiple-choice question and pick the single best option.\n"
-        "Respond using this format:\n"
-        "<think>your step-by-step reasoning</think>\n"
-        "Final Answer: <option letter>\n\n"
-        f"Question:\n{question}\n\n"
-        "Choices:\n"
-        f"{option_text}\n\n"
-        "Begin your reasoning now.\n<think>"
-    )
+    return prompt
 
 
 def mmlu_pro_prompt_cot(item: Dict) -> str:
@@ -94,19 +89,13 @@ def mmlu_pro_prompt_cot(item: Dict) -> str:
         for i, opt in enumerate(options) if i < len(option_labels)
     ])
     
-    category = item.get('category', item.get('subject', 'professional knowledge'))
+    prompt = f"""Question: {question}
+
+{option_text}
+
+Let's think step by step and then provide the answer (A, B, C, D, etc.):"""
     
-    return (
-        f"You are a very talented expert in {category}.\n"
-        "Conduct a careful chain-of-thought analysis before giving the final answer.\n"
-        "Respond using this format:\n"
-        "<think>your detailed reasoning</think>\n"
-        "Final Answer: <option letter>\n\n"
-        f"Question:\n{question}\n\n"
-        "Choices:\n"
-        f"{option_text}\n\n"
-        "Begin your reasoning now.\n<think>"
-    )
+    return prompt
 
 
 # ==================== 注册 ====================

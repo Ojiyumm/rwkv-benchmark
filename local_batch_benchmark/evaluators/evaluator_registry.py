@@ -108,14 +108,14 @@ def exact_match_evaluator(
     correct = 0
     total = 0
     
-    # 批量处理
+    # 批量处理（显存管理已在 batch_engine.py 层面处理）
     for i in range(0, len(data), batch_size):
         batch = data[i:i+batch_size]
         prompts = [item['prompt'] for item in batch]
         references = [item['reference'] for item in batch]
         
         # 生成
-        tokens, _ = engine.generate_batch(prompts, max_length=max_length, noise=noise)
+        tokens, _, _ = engine.generate_batch(prompts, max_length=max_length, noise=noise)
         predictions = engine.decode_tokens(tokens)
         
         # 评估
@@ -144,7 +144,7 @@ def exact_match_evaluator(
 def perplexity_evaluator(
     engine,
     data: List[Dict],
-    batch_size: int = 256,
+    batch_size: int = 64,
     pad_eod: bool = True,
     print_interval: int = 1000,
     **kwargs
@@ -261,19 +261,24 @@ def generation_evaluator(
     all_outputs = []
     total_tokens = 0
     total_time = 0
+    all_speed_stats = []
     
     # 批量处理
     for i in range(0, len(data), batch_size):
         batch = data[i:i+batch_size]
         prompts = [item['prompt'] for item in batch]
         
-        # 生成
-        tokens, inference_time = engine.generate_batch(
+        # 生成（记录速度统计）
+        tokens, inference_time, speed_stats = engine.generate_batch(
             prompts,
             max_length=max_length,
-            noise=noise
+            noise=noise,
+            return_speed=True
         )
         predictions = engine.decode_tokens(tokens)
+        
+        if speed_stats:
+            all_speed_stats.append(speed_stats)
         
         # 收集结果
         for j, pred in enumerate(predictions):
@@ -314,11 +319,20 @@ def generation_evaluator(
         'avg_length': avg_length
     }
     
+    # 计算平均速度（和 benchmark.py 一样的方法）
+    if all_speed_stats:
+        avg_forward_tps = sum(s['forward_tps'] for s in all_speed_stats) / len(all_speed_stats)
+        avg_full_tps = sum(s['full_tps'] for s in all_speed_stats) / len(all_speed_stats)
+        results['forward_tps'] = avg_forward_tps
+        results['full_tps'] = avg_full_tps
+    
     print(f"\nStatistics:")
     print(f"  Total tokens: {total_tokens}")
     print(f"  Total time: {total_time:.2f}s")
     print(f"  Throughput: {throughput:.2f} tokens/s")
     print(f"  Avg length: {avg_length:.1f} tokens/sample")
+    if 'forward_tps' in results:
+        print(f"  Speed (benchmark method): forward {results['forward_tps']:.2f} tok/s, full {results['full_tps']:.2f} tok/s")
     
     return results
 

@@ -1,7 +1,6 @@
 #!/bin/bash
 
 
-export HF_TOKEN=''
 export HF_HOME="~/.cache/huggingface"
 export HF_ENDPOINT=https://hf-mirror.com
 
